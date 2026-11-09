@@ -21,7 +21,7 @@ GEMINI_KEY = os.environ["GEMINI_API_KEY"]
 CF_ID = os.environ["CF_ACCOUNT_ID"]
 CF_TOKEN = os.environ["CF_API_TOKEN"]
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell"
 
 

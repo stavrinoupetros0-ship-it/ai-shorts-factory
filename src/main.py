@@ -69,7 +69,7 @@ photography without text, logos or watermarks.
                 "responseMimeType": "application/json"
             }
         },
-        timeout=120
+        timeout=300
     )
     response.raise_for_status()
 

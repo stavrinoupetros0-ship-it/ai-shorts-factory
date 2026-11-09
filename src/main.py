@@ -60,35 +60,44 @@ photography without text, logos or watermarks.
         f"v1beta/models/{GEMINI_MODEL}:generateContent"
     )
 
+    
     response = None
 
     for attempt in range(5):
-        response = requests.post(
-            url,
-            params={"key": GEMINI_KEY},
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "temperature": 0.8,
-                    "responseMimeType": "application/json"
-                }
-            },
-            timeout=300
-        )
+        try:
+            response = requests.post(
+                url,
+                params={"key": GEMINI_KEY},
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {
+                        "temperature": 0.8,
+                        "responseMimeType": "application/json"
+                    }
+                },
+                timeout=300
+            )
 
-        if response.status_code not in (429, 500, 502, 503, 504):
-            response.raise_for_status()
-            break
+            if response.status_code not in (429, 500, 502, 503, 504):
+                response.raise_for_status()
+                break
 
-        if attempt == 4:
-            response.raise_for_status()
+            if attempt == 4:
+                response.raise_for_status()
+
+        except (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError
+        ) as error:
+            if attempt == 4:
+                raise
+
+            print(f"Gemini connection failed: {error}")
 
         wait_seconds = 2 ** (attempt + 1)
-        print(
-            f"Gemini temporarily unavailable. "
-            f"Retrying in {wait_seconds} seconds..."
-        )
+        print(f"Retrying Gemini in {wait_seconds} seconds...")
         time.sleep(wait_seconds)
+
 
     raw = response.json()["candidates"][0]["content"]["parts"][0]["text"]
     raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE)

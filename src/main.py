@@ -59,6 +59,7 @@ photography without text, logos or watermarks.
         f"v1beta/models/{GEMINI_MODEL}:generateContent"
     )
 
+    for attempt in range(5):
     response = requests.post(
         url,
         params={"key": GEMINI_KEY},
@@ -69,9 +70,19 @@ photography without text, logos or watermarks.
                 "responseMimeType": "application/json"
             }
         },
-        timeout=300
+        timeout=120
     )
-    response.raise_for_status()
+
+    if response.status_code not in (429, 500, 502, 503, 504):
+        response.raise_for_status()
+        break
+
+    if attempt == 4:
+        response.raise_for_status()
+
+    wait_seconds = 2 ** (attempt + 1)
+    print(f"Gemini temporarily unavailable. Retrying in {wait_seconds} seconds...")
+    time.sleep(wait_seconds)
 
     raw = response.json()["candidates"][0]["content"]["parts"][0]["text"]
     raw = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.I | re.M)

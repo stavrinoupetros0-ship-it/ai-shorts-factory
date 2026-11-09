@@ -54,38 +54,44 @@ Image prompts must describe cinematic vertical
 photography without text, logos or watermarks.
 """
 
+
     url = (
         "https://generativelanguage.googleapis.com/"
         f"v1beta/models/{GEMINI_MODEL}:generateContent"
     )
 
+    response = None
+
     for attempt in range(5):
-    response = requests.post(
-        url,
-        params={"key": GEMINI_KEY},
-        json={
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": 0.8,
-                "responseMimeType": "application/json"
-            }
-        },
-        timeout=120
-    )
+        response = requests.post(
+            url,
+            params={"key": GEMINI_KEY},
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": 0.8,
+                    "responseMimeType": "application/json"
+                }
+            },
+            timeout=300
+        )
 
-    if response.status_code not in (429, 500, 502, 503, 504):
-        response.raise_for_status()
-        break
+        if response.status_code not in (429, 500, 502, 503, 504):
+            response.raise_for_status()
+            break
 
-    if attempt == 4:
-        response.raise_for_status()
+        if attempt == 4:
+            response.raise_for_status()
 
-    wait_seconds = 2 ** (attempt + 1)
-    print(f"Gemini temporarily unavailable. Retrying in {wait_seconds} seconds...")
-    time.sleep(wait_seconds)
+        wait_seconds = 2 ** (attempt + 1)
+        print(
+            f"Gemini temporarily unavailable. "
+            f"Retrying in {wait_seconds} seconds..."
+        )
+        time.sleep(wait_seconds)
 
     raw = response.json()["candidates"][0]["content"]["parts"][0]["text"]
-    raw = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.I | re.M)
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE)
 
     scripts = json.loads(raw)
 

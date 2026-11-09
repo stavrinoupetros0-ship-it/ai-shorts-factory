@@ -1,0 +1,63 @@
+
+name: Generate YouTube Shorts
+
+on:
+  workflow_dispatch:
+    inputs:
+      upload_to_youtube:
+        description: "Upload videos privately to YouTube"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate Shorts
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: gemini-2.5-flash
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          VIDEOS_PER_RUN: "5"
+          OUTPUT_DIR: output
+        run: python src/main.py
+
+      - name: Upload videos to YouTube
+        if: ${{ inputs.upload_to_youtube == true }}
+        env:
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+        run: python src/upload_youtube.py
+
+      - name: Save generated videos
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: youtube-shorts
+          path: output/
+          if-no-files-found: warn
+          retention-days: 7

@@ -1,0 +1,17 @@
+
+{
+  "categories": [
+    "strange historical events",
+    "unexplained mysteries",
+    "amazing science facts",
+    "space and universe",
+    "incredible animal facts",
+    "forgotten historical stories",
+    "mysterious places around the world"
+  ],
+  "language": "English",
+  "target_seconds": 45,
+  "videos_per_run": 5,
+  "style": "cinematic storytelling",
+  "target_audience": "worldwide"
+}

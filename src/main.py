@@ -1,4 +1,5 @@
 
+
 import os
 import json
 import re
@@ -20,16 +21,11 @@ if not OUT.is_absolute():
 
 OUT.mkdir(parents=True, exist_ok=True)
 
-COUNT = int(os.getenv("VIDEOS_PER_RUN", "5"))
+COUNT = int(os.getenv("VIDEOS_PER_RUN", "1"))
 
-GEMINI_KEY = os.environ["GEMINI_API_KEY"]
+OPENROUTER_KEY = os.environ["OPENROUTER_API_KEY"]
 CF_ID = os.environ["CF_ACCOUNT_ID"]
 CF_TOKEN = os.environ["CF_API_TOKEN"]
-
-GEMINI_MODEL = os.getenv(
-    "GEMINI_MODEL",
-    "gemini-3.8-flash"
-)
 
 IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell"
 
@@ -44,10 +40,10 @@ def post_with_retries(
     params=None,
     payload=None,
     timeout=(20, 120),
-    attempts=3,
+    attempts=4,
     label="API"
 ):
-    retryable = (429, 500, 502, 503, 504)
+    retryable = (408, 429, 500, 502, 503, 504)
 
     for attempt in range(1, attempts + 1):
         try:
@@ -63,20 +59,19 @@ def post_with_retries(
                 if attempt == attempts:
                     response.raise_for_status()
 
-                
                 retry_after = response.headers.get("Retry-After")
+
                 try:
                     wait = int(retry_after) if retry_after else min(
-                        15 * (2 ** (attempt - 1)), 120
+                        10 * (2 ** (attempt - 1)), 60
                     )
                 except (TypeError, ValueError):
-                    wait = min(15 * (2 ** (attempt - 1)), 120)
+                    wait = min(10 * (2 ** (attempt - 1)), 60)
 
                 print(
                     f"{label}: HTTP {response.status_code}. "
                     f"Retry {attempt}/{attempts} in {wait}s."
                 )
-
 
                 time.sleep(wait)
                 continue
@@ -94,11 +89,9 @@ def post_with_retries(
                     f"{label} failed after {attempts} attempts: {error}"
                 ) from error
 
-            wait = min(10 * (2 ** (attempt - 1)), 40)
+            wait = min(10 * (2 ** (attempt - 1)), 60)
 
-            print(
-                f"{label} connection failed: {error}"
-            )
+            print(f"{label} connection error: {error}")
             print(f"Retrying in {wait} seconds...")
 
             time.sleep(wait)
@@ -107,7 +100,7 @@ def post_with_retries(
 
 
 # -----------------------------
-# GEMINI STORY GENERATION
+# OPENROUTER SCRIPT GENERATION
 # -----------------------------
 
 def generate_scripts():
@@ -151,59 +144,75 @@ Image prompts must describe cinematic vertical
 photography without text, logos or watermarks.
 """
 
-    url = (
-        "https://generativelanguage.googleapis.com/"
-        f"v1beta/models/{GEMINI_MODEL}:generateContent"
-    )
+    url = "https://openrouter.ai/api/v1/chat/completions"
 
-    print(f"Connecting to Gemini: {GEMINI_MODEL}")
+    print("Connecting to OpenRouter...")
+    print("Using the FREE model router.")
     print(f"Requesting {COUNT} stories...")
 
     response = post_with_retries(
         url=url,
         headers={
-            "x-goog-api-key": GEMINI_KEY,
-            "Content-Type": "application/json"
+            "Authorization": f"Bearer {OPENROUTER_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/stavrinoupetros0-ship-it/ai-shorts-factory",
+            "X-Title": "YouTube Shorts Factory"
         },
         payload={
-            "contents": [
+            "model": "openrouter/free",
+            "messages": [
                 {
-                    "parts": [
-                        {"text": prompt}
-                    ]
+                    "role": "system",
+                    "content": (
+                        "You are an expert YouTube scriptwriter. "
+                        "Return valid JSON only. Use accurate facts. "
+                        "Never invent statistics or sources."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": prompt
                 }
             ],
-            "generationConfig": {
-                "temperature": 0.7,
-                "maxOutputTokens": 8192,
-                "responseMimeType": "application/json",
-                "thinkingConfig": {
-                    "thinkingLevel": "low"
-                }
-            }
+            "temperature": 0.7,
+            "max_tokens": 6000,
+            "stream": False
         },
-        timeout=(20, 120),
-        attempts=6,
-        label="Gemini"
+        timeout=(20, 180),
+        attempts=4,
+        label="OpenRouter"
     )
 
     data = response.json()
 
-    candidates = data.get("candidates", [])
+    selected_model = data.get("model", "unknown")
+    print(f"Free model selected: {selected_model}")
 
-    if not candidates:
+    # Extra safety: reject any response not identifying
+    # a free model. Never continue with a paid model.
+    if not selected_model.endswith(":free"):
         raise RuntimeError(
-            f"Gemini returned no candidates: {data}"
+            f"Unexpected model returned: {selected_model}. "
+            "Stopping to protect the zero-cost requirement."
         )
 
-    parts = candidates[0].get(
-        "content", {}
-    ).get("parts", [])
+    choices = data.get("choices", [])
 
-    raw = "".join(
-        part.get("text", "")
-        for part in parts
-    ).strip()
+    if not choices:
+        raise RuntimeError(
+            f"OpenRouter returned no choices: {data}"
+        )
+
+    raw = choices[0].get(
+        "message", {}
+    ).get("content", "")
+
+    if not isinstance(raw, str) or not raw.strip():
+        raise RuntimeError(
+            "OpenRouter returned empty content."
+        )
+
+    raw = raw.strip()
 
     raw = re.sub(
         r"^```(?:json)?\s*",
@@ -221,16 +230,16 @@ photography without text, logos or watermarks.
         scripts = json.loads(raw)
 
     except json.JSONDecodeError as error:
-        print("Gemini returned invalid JSON:")
+        print("OpenRouter returned invalid JSON:")
         print(raw[:2000])
 
         raise RuntimeError(
-            "Could not decode Gemini response."
+            "Could not decode OpenRouter response."
         ) from error
 
     if not isinstance(scripts, list):
         raise RuntimeError(
-            "Gemini response was not a JSON list."
+            "OpenRouter response was not a JSON list."
         )
 
     scripts = [
@@ -240,17 +249,11 @@ photography without text, logos or watermarks.
 
     if not scripts:
         raise RuntimeError(
-            "Gemini returned no usable stories."
-        )
-
-    if len(scripts) < COUNT:
-        print(
-            f"Warning: requested {COUNT} stories, "
-            f"received {len(scripts)}."
+            "OpenRouter returned no usable stories."
         )
 
     print(
-        f"Gemini successfully generated "
+        f"OpenRouter successfully generated "
         f"{len(scripts)} stories."
     )
 
@@ -339,10 +342,7 @@ async def generate_voice(text, destination):
 
             wait = 5 * (attempt + 1)
 
-            print(
-                f"Voice generation failed: {error}"
-            )
-
+            print(f"Voice generation failed: {error}")
             await asyncio.sleep(wait)
 
 
@@ -352,10 +352,7 @@ async def generate_voice(text, destination):
 
 def timestamp(seconds):
 
-    milliseconds = int(
-        (seconds % 1) * 1000
-    )
-
+    milliseconds = int((seconds % 1) * 1000)
     total = int(seconds)
 
     hours, remainder = divmod(total, 3600)
@@ -369,11 +366,7 @@ def timestamp(seconds):
     )
 
 
-def generate_subtitles(
-    text,
-    duration,
-    destination
-):
+def generate_subtitles(text, duration, destination):
 
     words = text.split()
 
@@ -383,9 +376,7 @@ def generate_subtitles(
     ]
 
     if not chunks:
-        raise RuntimeError(
-            "No subtitle text available."
-        )
+        raise RuntimeError("No subtitle text available.")
 
     lines = []
 
@@ -407,12 +398,7 @@ def generate_subtitles(
     )
 
 
-def render_video(
-    image,
-    audio,
-    subtitles,
-    destination
-):
+def render_video(image, audio, subtitles, destination):
 
     result = subprocess.check_output([
         "ffprobe",
@@ -512,11 +498,7 @@ def main():
         ).strip()
 
         if len(narration.split()) < 55:
-
-            print(
-                f"Skipping invalid short script: {title}"
-            )
-
+            print(f"Skipping invalid script: {title}")
             failed.append(title)
             continue
 
@@ -536,9 +518,7 @@ def main():
         try:
 
             generate_image(
-                str(
-                    story.get("image_prompt", title)
-                ),
+                str(story.get("image_prompt", title)),
                 image
             )
 
@@ -575,13 +555,9 @@ def main():
             description = (
                 str(story.get("description", ""))
                 + "\n\nSources:\n"
-                + "\n".join(
-                    story.get("source_urls", [])
-                )
+                + "\n".join(story.get("source_urls", []))
                 + "\n\n#Shorts "
-                + " ".join(
-                    story.get("hashtags", [])[:5]
-                )
+                + " ".join(story.get("hashtags", [])[:5])
             )
 
             manifest.append({
@@ -593,22 +569,14 @@ def main():
                 )
             })
 
-            print(
-                f"SUCCESS: Finished {title}"
-            )
+            print(f"SUCCESS: Finished {title}")
 
         except Exception as error:
 
-            print(
-                f"FAILED: {title}"
-            )
-
-            print(
-                f"Reason: {error}"
-            )
+            print(f"FAILED: {title}")
+            print(f"Reason: {error}")
 
             failed.append(title)
-
             continue
 
         time.sleep(2)
@@ -616,23 +584,13 @@ def main():
     manifest_path = OUT / "manifest.json"
 
     manifest_path.write_text(
-        json.dumps(
-            manifest,
-            indent=2
-        ),
+        json.dumps(manifest, indent=2),
         encoding="utf-8"
     )
 
     print("\n" + "=" * 50)
-
-    print(
-        f"SUCCESSFUL VIDEOS: {len(manifest)}"
-    )
-
-    print(
-        f"FAILED VIDEOS: {len(failed)}"
-    )
-
+    print(f"SUCCESSFUL VIDEOS: {len(manifest)}")
+    print(f"FAILED VIDEOS: {len(failed)}")
     print("=" * 50)
 
     if failed:
@@ -648,4 +606,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

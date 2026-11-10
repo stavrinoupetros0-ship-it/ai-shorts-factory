@@ -63,12 +63,20 @@ def post_with_retries(
                 if attempt == attempts:
                     response.raise_for_status()
 
-                wait = min(10 * (2 ** (attempt - 1)), 40)
+                
+                retry_after = response.headers.get("Retry-After")
+                try:
+                    wait = int(retry_after) if retry_after else min(
+                        15 * (2 ** (attempt - 1)), 120
+                    )
+                except (TypeError, ValueError):
+                    wait = min(15 * (2 ** (attempt - 1)), 120)
 
                 print(
                     f"{label}: HTTP {response.status_code}. "
                     f"Retry {attempt}/{attempts} in {wait}s."
                 )
+
 
                 time.sleep(wait)
                 continue
@@ -175,7 +183,7 @@ photography without text, logos or watermarks.
             }
         },
         timeout=(20, 120),
-        attempts=3,
+        attempts=6,
         label="Gemini"
     )
 

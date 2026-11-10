@@ -1,10 +1,4 @@
 
-"""Search and download commercially reusable video from Internet Archive.
-
-Only accepts explicit CC0, Public Domain, CC BY and CC BY-SA licence
-metadata. Every candidate must still be checked on its original item page.
-"""
-
 import argparse
 import html
 import json
@@ -20,12 +14,9 @@ from urllib3.util.retry import Retry
 SEARCH_URL = "https://archive.org/advancedsearch.php"
 METADATA_URL = "https://archive.org/metadata/"
 DOWNLOAD_URL = "https://archive.org/download/"
-USER_AGENT = "AIShortsFactory/1.0 (video research)"
 MAX_BYTES = 150 * 1024 * 1024
 
-VIDEO_EXTENSIONS = {
-    ".mp4", ".m4v", ".webm", ".mov", ".ogv"
-}
+VIDEO_EXTENSIONS = {".mp4", ".m4v", ".webm", ".mov", ".ogv"}
 
 
 def make_session():
@@ -34,14 +25,16 @@ def make_session():
         connect=3,
         read=3,
         status=4,
-        backoff_factor=4,
+        backoff_factor=3,
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=frozenset(["GET"]),
         respect_retry_after_header=True,
     )
     session = requests.Session()
     session.mount("https://", HTTPAdapter(max_retries=retry))
-    session.headers.update({"User-Agent": USER_AGENT})
+    session.headers.update({
+        "User-Agent": "AIShortsFactory/1.0 (video research)"
+    })
     return session
 
 
@@ -63,27 +56,26 @@ def allowed_license(value):
     return any(url.startswith(x) for x in accepted)
 
 
-def search_items(query, limit=10):
+def search_items(query, limit=5):
     session = make_session()
 
-    # Search only movie items. The exact licence is checked again
-    # against each item's metadata before it can be downloaded.
-    search_terms = re.findall(r"[A-Za-z0-9]+", query)
-    if not search_terms:
-        raise ValueError("Please provide a search query.")
-
-    term_query = " OR ".join(
-        f"title:{term}" for term in search_terms
+    # Search broadly by media type and licence metadata.
+    # Individual item licences are checked again below.
+    search_query = (
+        'mediatype:movies AND '
+        '(licenseurl:http*by* OR licenseurl:http*zero*)'
     )
-    params = {
-        "q": f"mediatype:movies AND ({term_query})",
-        "fl[]": [
-            "identifier", "title", "creator", "licenseurl"
-        ],
-        "rows": max(10, min(limit * 5, 50)),
-        "page": 1,
-        "output": "json",
-    }
+
+    params = [
+        ("q", search_query),
+        ("fl[]", "identifier"),
+        ("fl[]", "title"),
+        ("fl[]", "creator"),
+        ("fl[]", "licenseurl"),
+        ("rows", str(max(30, min(limit * 20, 100)))),
+        ("page", "1"),
+        ("output", "json"),
+    ]
 
     response = session.get(
         SEARCH_URL, params=params, timeout=(15, 45)
@@ -91,11 +83,28 @@ def search_items(query, limit=10):
     response.raise_for_status()
 
     docs = response.json().get("response", {}).get("docs", [])
+    print(f"Archive search returned {len(docs)} candidate items.")
+
     results = []
 
     for doc in docs:
         identifier = clean(doc.get("identifier"))
         if not identifier:
+            continue
+
+        # Check title/creator relevance after broad licence search.
+        text = (
+            clean(doc.get("title")) + " " +
+            clean(doc.get("creator"))
+        ).lower()
+        terms = [x.lower() for x in query.split() if len(x) > 2]
+
+        if terms and not any(term in text for term in terms):
+            continue
+
+        license_url = clean(doc.get("licenseurl"))
+
+        if not allowed_license(license_url):
             continue
 
         meta_response = session.get(
@@ -104,23 +113,19 @@ def search_items(query, limit=10):
         )
         meta_response.raise_for_status()
         metadata = meta_response.json()
-
         item_meta = metadata.get("metadata", {})
-        license_url = clean(
-            item_meta.get("licenseurl") or doc.get("licenseurl")
-        )
 
-        if not allowed_license(license_url):
+        # Recheck the actual item metadata, not only search index.
+        actual_license = clean(item_meta.get("licenseurl"))
+
+        if not allowed_license(actual_license):
             continue
 
-        files = metadata.get("files", [])
         video_files = []
 
-        for file_info in files:
+        for file_info in metadata.get("files", []):
             name = clean(file_info.get("name"))
-            extension = Path(name).suffix.lower()
-
-            if extension not in VIDEO_EXTENSIONS:
+            if Path(name).suffix.lower() not in VIDEO_EXTENSIONS:
                 continue
 
             try:
@@ -128,18 +133,15 @@ def search_items(query, limit=10):
             except (TypeError, ValueError):
                 continue
 
-            if size <= 0 or size > MAX_BYTES:
-                continue
-
-            video_files.append({
-                "name": name,
-                "size_bytes": size,
-            })
+            if 1024 <= size <= MAX_BYTES:
+                video_files.append({
+                    "name": name,
+                    "size_bytes": size,
+                })
 
         if not video_files:
             continue
 
-        # Prefer MP4 for easier editing, then smaller files.
         video_files.sort(
             key=lambda x: (
                 Path(x["name"]).suffix.lower() != ".mp4",
@@ -148,28 +150,29 @@ def search_items(query, limit=10):
         )
 
         selected = video_files[0]
+
         results.append({
             "identifier": identifier,
             "title": clean(item_meta.get("title") or doc.get("title")),
             "creator": clean(
                 item_meta.get("creator") or doc.get("creator")
             ),
-            "license": license_url,
+            "license": actual_license,
             "source_url": f"https://archive.org/details/{identifier}",
             "file_name": selected["name"],
             "size_bytes": selected["size_bytes"],
             "download_url": (
-                DOWNLOAD_URL
-                + quote(identifier, safe="")
-                + "/"
-                + quote(selected["name"], safe="/")
+                DOWNLOAD_URL + quote(identifier, safe="") +
+                "/" + quote(selected["name"], safe="/")
             ),
         })
+
+        print(f"Accepted: {identifier}")
 
         if len(results) >= limit:
             break
 
-        time.sleep(0.5)
+        time.sleep(0.3)
 
     return results
 
@@ -180,8 +183,7 @@ def download_item(item, output_dir):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     safe_name = re.sub(
-        r"[^A-Za-z0-9._-]+", "_",
-        item["identifier"]
+        r"[^A-Za-z0-9._-]+", "_", item["identifier"]
     ).strip("._")
 
     extension = Path(item["file_name"]).suffix.lower()
@@ -225,7 +227,7 @@ def download_item(item, output_dir):
         f"Creator: {item['creator'] or 'Not listed'}\n"
         f"Source: {item['source_url']}\n"
         f"Licence: {item['license']}\n"
-        f"Changes: May be cropped or edited for vertical video.\n"
+        "Changes: May be cropped or edited for vertical video.\n"
     )
 
     (output_dir / (safe_name + "_ATTRIBUTION.txt")).write_text(
@@ -240,7 +242,9 @@ def main():
     parser.add_argument("--query", required=True)
     parser.add_argument("--limit", type=int, default=5)
     parser.add_argument("--download-first", action="store_true")
-    parser.add_argument("--output-dir", default="output/archive-footage")
+    parser.add_argument(
+        "--output-dir", default="output/archive-footage"
+    )
     args = parser.parse_args()
 
     results = search_items(args.query, args.limit)
@@ -249,10 +253,10 @@ def main():
     print(f"\nFound {len(results)} videos with accepted licence metadata.")
 
     if args.download_first and results:
-        print("\nDownloading first result...")
         path = download_item(results[0], args.output_dir)
-        print(f"Downloaded: {path}")
-        print("Attribution records saved.")
+        print(f"Downloaded successfully: {path}")
+    elif args.download_first:
+        raise SystemExit("No suitable licensed videos were found.")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
-name: Test Wikimedia Footage Search
+
+name: Test Wikimedia Footage Download
 
 on:
   workflow_dispatch:
@@ -7,7 +8,7 @@ permissions:
   contents: read
 
 jobs:
-  search-footage:
+  download-footage:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -21,5 +22,17 @@ jobs:
       - name: Install requests
         run: pip install requests
 
-      - name: Search Wikimedia Commons for test footage
-        run: python src/footage.py --query "city timelapse" --limit 10
+      - name: Search and download verified test footage
+        run: |
+          python src/footage.py \
+            --query "Al Khiran Kuwait Google Earth Timelapse" \
+            --limit 5 \
+            --download-first
+
+      - name: Save downloaded video and credits
+        uses: actions/upload-artifact@v4
+        with:
+          name: wikimedia-test-footage
+          path: output/footage/
+          if-no-files-found: error
+          retention-days: 7

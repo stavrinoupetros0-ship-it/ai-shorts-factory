@@ -1,27 +1,26 @@
 
-
 import os
-import json
 import re
+import json
 import time
 import base64
 import asyncio
 import subprocess
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 import edge_tts
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
-
 OUT = Path(os.getenv("OUTPUT_DIR", "output"))
 if not OUT.is_absolute():
     OUT = ROOT / OUT
-
 OUT.mkdir(parents=True, exist_ok=True)
 
 COUNT = int(os.getenv("VIDEOS_PER_RUN", "1"))
+SCENE_COUNT = 5
 
 OPENROUTER_KEY = os.environ["OPENROUTER_API_KEY"]
 CF_ID = os.environ["CF_ACCOUNT_ID"]
@@ -30,49 +29,22 @@ CF_TOKEN = os.environ["CF_API_TOKEN"]
 IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell"
 
 
-# -----------------------------
-# HTTP REQUEST RETRIES
-# -----------------------------
-
-def post_with_retries(
-    url,
-    headers=None,
-    params=None,
-    payload=None,
-    timeout=(20, 120),
-    attempts=4,
-    label="API"
-):
-    retryable = (408, 429, 500, 502, 503, 504)
-
-    for attempt in range(1, attempts + 1):
+def post_retry(url, headers, payload, label, timeout=(20, 180)):
+    for attempt in range(1, 5):
         try:
             response = requests.post(
                 url,
                 headers=headers,
-                params=params,
                 json=payload,
                 timeout=timeout
             )
 
-            if response.status_code in retryable:
-                if attempt == attempts:
+            if response.status_code in (408, 429, 500, 502, 503, 504):
+                if attempt == 4:
                     response.raise_for_status()
 
-                retry_after = response.headers.get("Retry-After")
-
-                try:
-                    wait = int(retry_after) if retry_after else min(
-                        10 * (2 ** (attempt - 1)), 60
-                    )
-                except (TypeError, ValueError):
-                    wait = min(10 * (2 ** (attempt - 1)), 60)
-
-                print(
-                    f"{label}: HTTP {response.status_code}. "
-                    f"Retry {attempt}/{attempts} in {wait}s."
-                )
-
+                wait = min(10 * (2 ** (attempt - 1)), 60)
+                print(f"{label}: HTTP {response.status_code}; retrying in {wait}s")
                 time.sleep(wait)
                 continue
 
@@ -82,276 +54,209 @@ def post_with_retries(
         except (
             requests.exceptions.Timeout,
             requests.exceptions.ConnectionError
-        ) as error:
-
-            if attempt == attempts:
-                raise RuntimeError(
-                    f"{label} failed after {attempts} attempts: {error}"
-                ) from error
+        ):
+            if attempt == 4:
+                raise
 
             wait = min(10 * (2 ** (attempt - 1)), 60)
-
-            print(f"{label} connection error: {error}")
-            print(f"Retrying in {wait} seconds...")
-
+            print(f"{label}: connection issue; retrying in {wait}s")
             time.sleep(wait)
 
-    raise RuntimeError(f"{label} failed.")
+    raise RuntimeError(f"{label} failed")
 
 
-# -----------------------------
-# OPENROUTER SCRIPT GENERATION
-# -----------------------------
-
-def generate_scripts():
-
-    topics = json.loads(
-        (ROOT / "config/topics.json").read_text(
-            encoding="utf-8"
-        )
-    )
-
-    prompt = f"""
-Create exactly {COUNT} original YouTube Shorts scripts.
-
-Topics: {topics['categories']}
-
-Requirements:
-
-- English language.
-- 90-115 spoken words per story.
-- Strong opening hook.
-- Engaging storytelling.
-- Accurate, verifiable facts.
-- No invented statistics or fake events.
-- Include credible source URLs.
-- Each story must be different.
-- Avoid repeating previous stories.
-
-Return ONLY a valid JSON array.
-
-Each object must contain:
-
-title
-category
-narration
-image_prompt
-description
-hashtags
-source_urls
-
-Image prompts must describe cinematic vertical
-photography without text, logos or watermarks.
-"""
-
-    url = "https://openrouter.ai/api/v1/chat/completions"
-
-    print("Connecting to OpenRouter...")
-    print("Using the FREE model router.")
-    print(f"Requesting {COUNT} stories...")
-
-    response = post_with_retries(
-        url=url,
-        headers={
+def openrouter_json(messages):
+    response = post_retry(
+        "https://openrouter.ai/api/v1/chat/completions",
+        {
             "Authorization": f"Bearer {OPENROUTER_KEY}",
             "Content-Type": "application/json",
             "HTTP-Referer": "https://github.com/stavrinoupetros0-ship-it/ai-shorts-factory",
             "X-Title": "YouTube Shorts Factory"
         },
-        payload={
+        {
             "model": "openrouter/free",
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an expert YouTube scriptwriter. "
-                        "Return valid JSON only. Use accurate facts. "
-                        "Never invent statistics or sources."
-                    )
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            "temperature": 0.7,
-            "max_tokens": 6000,
+            "messages": messages,
+            "temperature": 0.55,
+            "max_tokens": 7000,
             "stream": False
         },
-        timeout=(20, 180),
-        attempts=4,
-        label="OpenRouter"
+        "OpenRouter"
     )
 
     data = response.json()
+    selected_model = str(data.get("model", "unknown"))
 
-    selected_model = data.get("model", "unknown")
     print(f"Free model selected: {selected_model}")
 
-    # Extra safety: reject any response not identifying
-    # a free model. Never continue with a paid model.
     if not selected_model.endswith(":free"):
         raise RuntimeError(
-            f"Unexpected model returned: {selected_model}. "
-            "Stopping to protect the zero-cost requirement."
+            f"Paid or unverified model blocked: {selected_model}"
         )
 
     choices = data.get("choices", [])
 
     if not choices:
-        raise RuntimeError(
-            f"OpenRouter returned no choices: {data}"
-        )
+        raise RuntimeError("OpenRouter returned no choices.")
 
-    raw = choices[0].get(
-        "message", {}
-    ).get("content", "")
+    raw = choices[0].get("message", {}).get("content", "")
 
     if not isinstance(raw, str) or not raw.strip():
-        raise RuntimeError(
-            "OpenRouter returned empty content."
-        )
+        raise RuntimeError("OpenRouter returned empty content.")
 
-    raw = raw.strip()
-
-    raw = re.sub(
-        r"^```(?:json)?\s*",
-        "",
-        raw
-    )
-
-    raw = re.sub(
-        r"\s*```$",
-        "",
-        raw
-    )
+    raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
+    raw = re.sub(r"\s*```$", "", raw)
 
     try:
-        scripts = json.loads(raw)
-
+        return json.loads(raw)
     except json.JSONDecodeError as error:
-        print("OpenRouter returned invalid JSON:")
-        print(raw[:2000])
+        print(raw[:1500])
+        raise RuntimeError("OpenRouter returned invalid JSON.") from error
 
-        raise RuntimeError(
-            "Could not decode OpenRouter response."
-        ) from error
 
-    if not isinstance(scripts, list):
-        raise RuntimeError(
-            "OpenRouter response was not a JSON list."
-        )
-
-    scripts = [
-        item for item in scripts
-        if isinstance(item, dict)
-    ]
-
-    if not scripts:
-        raise RuntimeError(
-            "OpenRouter returned no usable stories."
-        )
-
-    print(
-        f"OpenRouter successfully generated "
-        f"{len(scripts)} stories."
+def generate_scripts():
+    topics = json.loads(
+        (ROOT / "config/topics.json").read_text(encoding="utf-8")
     )
 
-    return scripts[:COUNT]
+    prompt = f"""
+Create exactly {COUNT} original YouTube Shorts scripts.
 
+Choose from these topic categories:
+{topics['categories']}
 
-# -----------------------------
-# CLOUDFLARE IMAGE GENERATION
-# -----------------------------
+Narration must contain 95-115 spoken words, approximately 40-55 seconds.
+
+Return ONLY a valid JSON array.
+
+Each story must contain:
+title
+category
+narration
+description
+hashtags
+source_urls
+scene_prompts
+
+IMPORTANT REQUIREMENTS:
+
+1. Start with a strong, specific hook.
+2. Tell a clear story with a surprising development and satisfying ending.
+3. Do not invent dates, statistics, quotes or discoveries.
+4. Distinguish established facts from theories.
+5. Include 2-4 direct HTTPS source URLs from credible institutions,
+   museums, universities, journals or established reference works.
+6. Do not invent URLs.
+7. Do not put source URLs in the spoken narration.
+8. Make exactly FIVE different scene_prompts.
+9. Each scene must show a different shot, subject, detail or location.
+10. Put the scenes in the same order as the narration.
+11. Use cinematic documentary photography, vertical 9:16.
+12. No text, logos or watermarks in the images.
+13. Write natural spoken English.
+"""
+
+    print("Connecting to OpenRouter...")
+    print("Using the FREE model router.")
+
+    result = openrouter_json([
+        {
+            "role": "system",
+            "content": (
+                "You are a careful documentary researcher and "
+                "YouTube storyteller. Return valid JSON only. "
+                "Never fabricate facts or references."
+            )
+        },
+        {"role": "user", "content": prompt}
+    ])
+
+    if not isinstance(result, list):
+        raise RuntimeError("Expected a JSON array.")
+
+    stories = [item for item in result if isinstance(item, dict)]
+
+    if not stories:
+        raise RuntimeError("No usable stories returned.")
+
+    print(f"OpenRouter generated {len(stories)} story.")
+    return stories[:COUNT]
+
 
 def generate_image(prompt, destination):
-
     url = (
         "https://api.cloudflare.com/client/v4/accounts/"
         f"{CF_ID}/ai/run/{IMAGE_MODEL}"
     )
 
-    response = post_with_retries(
-        url=url,
-        headers={
+    response = post_retry(
+        url,
+        {
             "Authorization": f"Bearer {CF_TOKEN}",
             "Content-Type": "application/json"
         },
-        payload={
+        {
             "prompt": (
-                prompt
-                + ", vertical 9:16 cinematic composition, "
-                "photorealistic, dramatic lighting, "
-                "no text, no watermark"
+                str(prompt)
+                + ", vertical 9:16 cinematic documentary photography, "
+                "highly detailed, natural lighting, no text, "
+                "no logos, no watermark"
             )
         },
-        timeout=(20, 180),
-        attempts=3,
-        label="Cloudflare image generation"
+        "Cloudflare image generation"
     )
 
-    content_type = response.headers.get(
-        "content-type", ""
-    )
-
-    if "image" in content_type:
+    if "image" in response.headers.get("content-type", ""):
         destination.write_bytes(response.content)
-
     else:
-        result = response.json().get("result", {})
-        image_data = result.get("image")
+        image_data = response.json().get("result", {}).get("image")
 
         if not image_data:
-            raise RuntimeError(
-                "Cloudflare returned no image."
-            )
+            raise RuntimeError("Cloudflare returned no image.")
 
-        destination.write_bytes(
-            base64.b64decode(image_data)
-        )
+        destination.write_bytes(base64.b64decode(image_data))
 
     with Image.open(destination) as image:
         image.verify()
 
-    print(f"Image saved: {destination.name}")
+    print(f"Image ready: {destination.name}")
 
-
-# -----------------------------
-# VOICE GENERATION
-# -----------------------------
 
 async def generate_voice(text, destination):
-
     for attempt in range(3):
-
         try:
             voice = edge_tts.Communicate(
                 text,
                 voice="en-US-AriaNeural",
-                rate="+3%",
+                rate="+2%",
                 pitch="-1Hz"
             )
-
             await voice.save(str(destination))
             return
 
-        except Exception as error:
-
+        except Exception:
             if attempt == 2:
                 raise
 
-            wait = 5 * (attempt + 1)
-
-            print(f"Voice generation failed: {error}")
-            await asyncio.sleep(wait)
+            await asyncio.sleep(5 * (attempt + 1))
 
 
-# -----------------------------
-# VIDEO UTILITIES
-# -----------------------------
+def get_duration(audio):
+    result = subprocess.check_output(
+        [
+            "ffprobe",
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(audio)
+        ],
+        text=True
+    )
 
-def timestamp(seconds):
+    return float(result.strip())
 
+
+def make_timestamp(seconds):
     milliseconds = int((seconds % 1) * 1000)
     total = int(seconds)
 
@@ -359,20 +264,17 @@ def timestamp(seconds):
     minutes, secs = divmod(remainder, 60)
 
     return (
-        f"{hours:02}:"
-        f"{minutes:02}:"
-        f"{secs:02},"
-        f"{milliseconds:03}"
+        f"{hours:02}:{minutes:02}:"
+        f"{secs:02},{milliseconds:03}"
     )
 
 
 def generate_subtitles(text, duration, destination):
-
     words = text.split()
 
     chunks = [
-        " ".join(words[i:i + 6])
-        for i in range(0, len(words), 6)
+        " ".join(words[i:i + 4])
+        for i in range(0, len(words), 4)
     ]
 
     if not chunks:
@@ -381,13 +283,12 @@ def generate_subtitles(text, duration, destination):
     lines = []
 
     for index, chunk in enumerate(chunks):
-
         start = duration * index / len(chunks)
         end = duration * (index + 1) / len(chunks)
 
         lines.extend([
             str(index + 1),
-            f"{timestamp(start)} --> {timestamp(end)}",
+            f"{make_timestamp(start)} --> {make_timestamp(end)}",
             chunk,
             ""
         ])
@@ -398,45 +299,69 @@ def generate_subtitles(text, duration, destination):
     )
 
 
-def render_video(image, audio, subtitles, destination):
+def render_video(images, audio, subtitles, destination, duration):
+    scene_duration = duration / len(images)
 
-    result = subprocess.check_output([
-        "ffprobe",
-        "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        str(audio)
-    ], text=True)
+    command = ["ffmpeg", "-y"]
 
-    duration = float(result.strip())
+    for image in images:
+        command += [
+            "-loop", "1",
+            "-framerate", "30",
+            "-t", f"{scene_duration:.4f}",
+            "-i", str(image)
+        ]
 
-    subtitle_path = str(
-        subtitles.resolve()
-    ).replace("\\", "/").replace(":", r"\:")
+    filters = []
+    labels = []
 
-    video_filter = (
-        "scale=1080:1920:"
-        "force_original_aspect_ratio=increase,"
-        "crop=1080:1920,"
-        "zoompan=z='min(zoom+0.0007,1.12)':d=1:"
-        "x='iw/2-(iw/zoom/2)':"
-        "y='ih/2-(ih/zoom/2)':"
-        "s=1080x1920:fps=30,"
-        f"subtitles='{subtitle_path}':"
-        "force_style='FontName=DejaVu Sans,"
-        "FontSize=18,PrimaryColour=&H00FFFFFF,"
-        "OutlineColour=&H00000000,BorderStyle=1,"
-        "Outline=3,Shadow=1,Alignment=2,MarginV=150'"
+    for index in range(len(images)):
+        label = f"scene{index}"
+        labels.append(f"[{label}]")
+
+        filters.append(
+            f"[{index}:v]"
+            "scale=1080:1920:force_original_aspect_ratio=increase,"
+            "crop=1080:1920,"
+            "zoompan=z='min(zoom+0.0008,1.13)':d=1:"
+            "x='iw/2-(iw/zoom/2)':"
+            "y='ih/2-(ih/zoom/2)':"
+            "s=1080x1920:fps=30,"
+            f"trim=duration={scene_duration:.4f},"
+            "setpts=PTS-STARTPTS,setsar=1"
+            f"[{label}]"
+        )
+
+    filters.append(
+        "".join(labels)
+        + f"concat=n={len(images)}:v=1:a=0[base]"
     )
 
-    command = [
-        "ffmpeg", "-y",
-        "-loop", "1",
-        "-framerate", "30",
-        "-i", str(image),
+    subtitle_path = str(subtitles.resolve()).replace("\\", "/")
+    subtitle_path = subtitle_path.replace(":", r"\:")
+
+    filters.append(
+        "[base]subtitles='"
+        + subtitle_path
+        + "':force_style='"
+        "FontName=DejaVu Sans,"
+        "FontSize=19,"
+        "PrimaryColour=&H00FFFFFF,"
+        "OutlineColour=&H00000000,"
+        "BorderStyle=1,"
+        "Outline=3,"
+        "Shadow=1,"
+        "Alignment=2,"
+        "MarginV=150'"
+        "[vout]"
+    )
+
+    command += [
+        "-filter_complex", ";".join(filters),
         "-i", str(audio),
-        "-t", str(duration),
-        "-vf", video_filter,
+        "-map", "[vout]",
+        "-map", f"{len(images)}:a",
+        "-t", f"{duration:.3f}",
         "-r", "30",
         "-c:v", "libx264",
         "-preset", "veryfast",
@@ -456,88 +381,77 @@ def render_video(image, audio, subtitles, destination):
 
     if result.returncode != 0:
         raise RuntimeError(
-            f"FFmpeg failed:\n{result.stderr[-3000:]}"
+            "FFmpeg failed:\n" + result.stderr[-3500:]
         )
 
 
-# -----------------------------
-# FILE UTILITIES
-# -----------------------------
-
 def safe_filename(title):
-
     return (
-        re.sub(
-            r"[^a-zA-Z0-9_-]+",
-            "_",
-            title
-        ).strip("_")[:45]
+        re.sub(r"[^a-zA-Z0-9_-]+", "_", title)
+        .strip("_")[:45]
         or "short"
     )
 
 
-# -----------------------------
-# MAIN GENERATION PROCESS
-# -----------------------------
-
 def main():
-
-    scripts = generate_scripts()
+    stories = generate_scripts()
 
     manifest = []
     failed = []
 
-    for index, story in enumerate(scripts, 1):
+    for index, story in enumerate(stories, 1):
+        title = str(story.get("title", f"Story {index}"))[:95]
+        narration = str(story.get("narration", "")).strip()
 
-        title = str(
-            story.get("title", f"Story {index}")
-        )[:95]
-
-        narration = str(
-            story.get("narration", "")
-        ).strip()
-
-        if len(narration.split()) < 55:
-            print(f"Skipping invalid script: {title}")
+        if not 75 <= len(narration.split()) <= 140:
+            print(f"Skipping unsuitable narration length: {title}")
             failed.append(title)
             continue
 
-        filename = (
-            f"{index:02d}_{safe_filename(title)}"
-        )
+        filename = f"{index:02d}_{safe_filename(title)}"
 
-        image = OUT / f"{filename}.png"
         audio = OUT / f"{filename}.mp3"
         subtitles = OUT / f"{filename}.srt"
         video = OUT / f"{filename}.mp4"
 
+        prompts = story.get("scene_prompts", [])
+
+        if not isinstance(prompts, list):
+            prompts = []
+
+        prompts = [
+            str(prompt).strip()
+            for prompt in prompts
+            if str(prompt).strip()
+        ]
+
+        if len(prompts) < SCENE_COUNT:
+            raise RuntimeError(
+                "The script must provide five distinct scene prompts. "
+                "Refusing to repeat one image."
+            )
+
+        prompts = prompts[:SCENE_COUNT]
+
+        images = [
+            OUT / f"{filename}_scene_{number:02d}.png"
+            for number in range(1, SCENE_COUNT + 1)
+        ]
+
         print("\n" + "=" * 50)
-        print(f"Generating story {index}: {title}")
+        print(f"Generating: {title}")
         print("=" * 50)
 
         try:
+            for number, (prompt, image) in enumerate(
+                zip(prompts, images), 1
+            ):
+                print(f"Creating visual {number}/{SCENE_COUNT}")
+                generate_image(prompt, image)
 
-            generate_image(
-                str(story.get("image_prompt", title)),
-                image
-            )
+            asyncio.run(generate_voice(narration, audio))
 
-            asyncio.run(
-                generate_voice(
-                    narration,
-                    audio
-                )
-            )
-
-            probe = subprocess.check_output([
-                "ffprobe",
-                "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                str(audio)
-            ], text=True)
-
-            duration = float(probe.strip())
+            duration = get_duration(audio)
 
             generate_subtitles(
                 narration,
@@ -546,16 +460,33 @@ def main():
             )
 
             render_video(
-                image,
+                images,
                 audio,
                 subtitles,
-                video
+                video,
+                duration
             )
+
+            sources = []
+
+            source_urls = story.get("source_urls", [])
+
+            if isinstance(source_urls, list):
+                for source in source_urls:
+                    source = str(source).strip()
+                    parsed = urlparse(source)
+
+                    if (
+                        parsed.scheme == "https"
+                        and parsed.netloc
+                        and source not in sources
+                    ):
+                        sources.append(source)
 
             description = (
                 str(story.get("description", ""))
-                + "\n\nSources:\n"
-                + "\n".join(story.get("source_urls", []))
+                + "\n\nSources (review before publishing):\n"
+                + "\n".join(sources)
                 + "\n\n#Shorts "
                 + " ".join(story.get("hashtags", [])[:5])
             )
@@ -564,44 +495,29 @@ def main():
                 "title": title,
                 "description": description[:4900],
                 "video": str(video),
-                "category": story.get(
-                    "category", "Education"
-                )
+                "duration_seconds": round(duration, 2),
+                "visual_scenes": len(images),
+                "scene_images": [str(image) for image in images],
+                "source_urls": sources,
+                "category": story.get("category", "Education")
             })
 
             print(f"SUCCESS: Finished {title}")
 
         except Exception as error:
-
-            print(f"FAILED: {title}")
-            print(f"Reason: {error}")
-
+            print(f"FAILED: {title} - {error}")
             failed.append(title)
-            continue
 
-        time.sleep(2)
-
-    manifest_path = OUT / "manifest.json"
-
-    manifest_path.write_text(
+    (OUT / "manifest.json").write_text(
         json.dumps(manifest, indent=2),
         encoding="utf-8"
     )
 
-    print("\n" + "=" * 50)
     print(f"SUCCESSFUL VIDEOS: {len(manifest)}")
     print(f"FAILED VIDEOS: {len(failed)}")
-    print("=" * 50)
-
-    if failed:
-        print("Failed stories:")
-        for title in failed:
-            print(f"- {title}")
 
     if not manifest:
-        raise RuntimeError(
-            "No videos were successfully generated."
-        )
+        raise RuntimeError("No videos were successfully generated.")
 
 
 if __name__ == "__main__":

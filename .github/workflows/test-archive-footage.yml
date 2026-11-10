@@ -1,0 +1,38 @@
+
+name: Test Internet Archive Footage
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-archive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Search and download test footage
+        run: |
+          python src/archive_footage.py \
+            --query "city timelapse" \
+            --limit 5 \
+            --download-first
+
+      - name: Save footage and credits
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-test-footage
+          path: output/archive-footage/
+          if-no-files-found: error
+          retention-days: 7

@@ -5,11 +5,14 @@ import argparse
 import html
 import json
 import re
+import time
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import quote
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 API_URL = "https://commons.wikimedia.org/w/api.php"
 USER_AGENT = "AIShortsFactory/1.0 (footage research)"
@@ -21,6 +24,27 @@ VIDEO_MIMES = {
     "video/ogg": ".ogv",
     "video/quicktime": ".mov",
 }
+
+
+def make_session():
+    """Create a session that retries temporary server rate limits."""
+    retry = Retry(
+        total=5,
+        connect=3,
+        read=3,
+        status=5,
+        backoff_factor=5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET"]),
+        respect_retry_after_header=True,
+        raise_on_status=True,
+    )
+
+    session = requests.Session()
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.headers.update({"User-Agent": USER_AGENT})
+    return session
 
 
 class TextExtractor(HTMLParser):
@@ -54,8 +78,10 @@ def commercial_license_ok(metadata):
     text = f"{short} {terms} {url}".lower()
 
     if any(x in text for x in (
-        "noncommercial", "non-commercial",
-        "no derivatives", "no-derivatives"
+        "noncommercial",
+        "non-commercial",
+        "no derivatives",
+        "no-derivatives",
     )):
         return False
 
@@ -64,12 +90,14 @@ def commercial_license_ok(metadata):
         r"\bcc by(?:-sa)?(?:\s|$)|"
         r"\bcreative commons attribution",
         text,
-        re.IGNORECASE
+        re.IGNORECASE,
     ))
 
 
 def search_commons_videos(query, limit=10):
-    response = requests.get(
+    session = make_session()
+
+    response = session.get(
         API_URL,
         params={
             "action": "query",
@@ -82,7 +110,6 @@ def search_commons_videos(query, limit=10):
             "prop": "imageinfo",
             "iiprop": "url|mime|size|extmetadata",
         },
-        headers={"User-Agent": USER_AGENT},
         timeout=(15, 45),
     )
     response.raise_for_status()
@@ -101,6 +128,7 @@ def search_commons_videos(query, limit=10):
 
         if mime not in VIDEO_MIMES:
             continue
+
         if not commercial_license_ok(metadata):
             continue
 
@@ -151,40 +179,48 @@ def download_video(item, output_dir):
     extension = VIDEO_MIMES[item["mime"]]
     destination = output_dir / (safe_name[:100] + extension)
 
+    session = make_session()
     total = 0
 
-    with requests.get(
-        url,
-        headers={"User-Agent": USER_AGENT},
-        stream=True,
-        timeout=(20, 90),
-    ) as response:
-        response.raise_for_status()
+    try:
+        with session.get(
+            url,
+            stream=True,
+            timeout=(20, 90),
+        ) as response:
+            response.raise_for_status()
 
-        content_type = response.headers.get(
-            "Content-Type", ""
-        ).split(";")[0].lower()
+            content_type = response.headers.get(
+                "Content-Type", ""
+            ).split(";")[0].lower()
 
-        if content_type and content_type not in (
-            *VIDEO_MIMES.keys(), "application/octet-stream"
-        ):
-            raise ValueError(
-                f"Unexpected download type: {content_type}"
-            )
+            if content_type and content_type not in (
+                *VIDEO_MIMES.keys(),
+                "application/octet-stream",
+            ):
+                raise ValueError(
+                    f"Unexpected download type: {content_type}"
+                )
 
-        with destination.open("wb") as output:
-            for chunk in response.iter_content(1024 * 1024):
-                if not chunk:
-                    continue
+            with destination.open("wb") as output:
+                for chunk in response.iter_content(
+                    chunk_size=1024 * 1024
+                ):
+                    if not chunk:
+                        continue
 
-                total += len(chunk)
+                    total += len(chunk)
 
-                if total > MAX_DOWNLOAD_BYTES:
-                    output.close()
-                    destination.unlink(missing_ok=True)
-                    raise ValueError("Download exceeded 150 MB.")
+                    if total > MAX_DOWNLOAD_BYTES:
+                        raise ValueError(
+                            "Download exceeded 150 MB."
+                        )
 
-                output.write(chunk)
+                    output.write(chunk)
+
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
 
     if total < 1024:
         destination.unlink(missing_ok=True)
@@ -193,7 +229,9 @@ def download_video(item, output_dir):
     item["local_file"] = str(destination)
     item["downloaded_bytes"] = total
 
-    manifest = output_dir / (safe_name[:100] + "_credits.json")
+    manifest = output_dir / (
+        safe_name[:100] + "_credits.json"
+    )
     manifest.write_text(
         json.dumps(item, indent=2, ensure_ascii=False),
         encoding="utf-8",
@@ -205,28 +243,30 @@ def download_video(item, output_dir):
         f"Source: {item['page_url']}\n"
         f"Licence: {item['license']}\n"
         f"Licence URL: {item['license_url']}\n"
-        f"Changes: Video may be cropped or edited for vertical format.\n"
+        "Changes: Video may be cropped or edited for vertical format.\n"
     )
 
-    (output_dir / (safe_name[:100] + "_ATTRIBUTION.txt")).write_text(
-        attribution, encoding="utf-8"
-    )
+    (output_dir / (
+        safe_name[:100] + "_ATTRIBUTION.txt"
+    )).write_text(attribution, encoding="utf-8")
 
     return destination
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Search and download reusable Wikimedia videos."
+    )
     parser.add_argument("--query", required=True)
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument(
         "--download-first",
         action="store_true",
-        help="Download the first matching result and save its credits."
+        help="Download the first matching result and save its credits.",
     )
     parser.add_argument(
         "--output-dir",
-        default="output/footage"
+        default="output/footage",
     )
     args = parser.parse_args()
 
@@ -236,9 +276,12 @@ def main():
     print(f"\nFound {len(results)} matching videos.")
 
     if args.download_first and results:
+        print("\nDownloading first matching video...")
         path = download_video(results[0], args.output_dir)
-        print(f"\nDownloaded: {path}")
+        print(f"\nDownloaded successfully: {path}")
         print("Attribution and licence records saved alongside it.")
+    elif args.download_first:
+        print("No matching videos were available to download.")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,137 @@
+
+name: Gaming Content Rewards Clips
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_video_url:
+        description: "Direct HTTPS link to campaign-authorized video footage"
+        required: true
+        type: string
+      campaign:
+        description: "Campaign name"
+        required: true
+        type: string
+      hook:
+        description: "Opening text shown on screen"
+        required: false
+        type: string
+        default: ""
+      clip_seconds:
+        description: "Length of each clip"
+        required: true
+        type: choice
+        options:
+          - "15"
+          - "20"
+          - "30"
+          - "45"
+          - "60"
+        default: "30"
+      clips:
+        description: "Number of clips"
+        required: true
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
+          - "5"
+          - "10"
+        default: "3"
+
+permissions:
+  contents: read
+
+jobs:
+  create-gaming-clips:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out project
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install --upgrade pip
+          python -m pip install Pillow
+
+      - name: Download campaign footage
+        env:
+          SOURCE_VIDEO_URL: ${{ inputs.source_video_url }}
+        run: |
+          python - <<'PY'
+          import os
+          import urllib.request
+          from urllib.parse import urlparse
+
+          url = os.environ["SOURCE_VIDEO_URL"].strip()
+          parsed = urlparse(url)
+
+          if parsed.scheme != "https" or not parsed.netloc:
+              raise SystemExit("Please provide a valid HTTPS video link.")
+
+          request = urllib.request.Request(
+              url,
+              headers={"User-Agent": "AI-Shorts-Factory/1.0"}
+          )
+
+          with urllib.request.urlopen(request, timeout=30) as response:
+              if urlparse(response.geturl()).scheme != "https":
+                  raise SystemExit("Download redirected away from HTTPS.")
+
+              content_type = response.headers.get("Content-Type", "").lower()
+              if "text/html" in content_type:
+                  raise SystemExit("This is a webpage, not a direct video link.")
+
+              total = 0
+              os.makedirs("input/gaming", exist_ok=True)
+
+              with open("input/gaming/source_video", "wb") as output:
+                  while True:
+                      chunk = response.read(1024 * 1024)
+                      if not chunk:
+                          break
+
+                      total += len(chunk)
+                      if total > 150 * 1024 * 1024:
+                          raise SystemExit("Video exceeds the 150 MB limit.")
+
+                      output.write(chunk)
+
+          if total < 1024:
+              raise SystemExit("Downloaded file is empty or too small.")
+
+          print(f"Downloaded {total / (1024 * 1024):.1f} MB.")
+          PY
+
+      - name: Create gaming clips
+        env:
+          CAMPAIGN: ${{ inputs.campaign }}
+          HOOK: ${{ inputs.hook }}
+          CLIP_SECONDS: ${{ inputs.clip_seconds }}
+          CLIPS: ${{ inputs.clips }}
+        run: |
+          python src/gaming_clipper.py \
+            --input input/gaming/source_video \
+            --campaign "$CAMPAIGN" \
+            --hook "$HOOK" \
+            --clip-seconds "$CLIP_SECONDS" \
+            --clips "$CLIPS" \
+            --output-dir output/gaming
+
+      - name: Upload clips
+        uses: actions/upload-artifact@v4
+        with:
+          name: gaming-clips
+          path: output/gaming/
+          if-no-files-found: error
+          retention-days: 7

@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""Discover public GTA 6 videos for research only; never downloads source media."""
+import json
+import os
+from pathlib import Path
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+KEY = os.environ.get("YOUTUBE_API_KEY", "").strip()
+OUT = Path(os.environ.get("OUTPUT_DIR", "output"))
+QUERIES = [
+    "GTA 6 gameplay analysis",
+    "GTA 6 news discussion",
+    "GTA 6 interview",
+    "GTA 6 trailer breakdown",
+    "GTA 6 features discussion",
+]
+
+if not KEY:
+    raise SystemExit("Missing YOUTUBE_API_KEY secret (YouTube Data API v3).")
+
+OUT.mkdir(parents=True, exist_ok=True)
+results, seen = [], set()
+
+for query in QUERIES:
+    params = urlencode({
+        "part": "snippet",
+        "q": query,
+        "type": "video",
+        "videoDuration": "long",
+        "order": "date",
+        "maxResults": 25,
+        "key": KEY,
+    })
+    url = "https://www.googleapis.com/youtube/v3/search?" + params
+    request = Request(url, headers={"Accept": "application/json"})
+    with urlopen(request, timeout=30) as response:
+        payload = json.load(response)
+
+    for item in payload.get("items", []):
+        video_id = item.get("id", {}).get("videoId")
+        if not video_id or video_id in seen:
+            continue
+        seen.add(video_id)
+        snippet = item.get("snippet", {})
+        results.append({
+            "video_id": video_id,
+            "title": snippet.get("title", ""),
+            "channel_title": snippet.get("channelTitle", ""),
+            "published_at": snippet.get("publishedAt", ""),
+            "description": snippet.get("description", ""),
+            "watch_url": f"https://www.youtube.com/watch?v={video_id}",
+            "discovery_only": True,
+            "permission_granted": False,
+        })
+
+path = OUT / "gta6_discovery.json"
+path.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
+print(f"Found {len(results)} public GTA 6 long-form video results.")
+print("Discovery results are research leads only; no video was downloaded.")
